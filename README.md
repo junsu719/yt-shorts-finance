@@ -2,6 +2,15 @@
 
 繁體中文財經短影音自動化系統。輸入主題字串，自動生成可上傳至 YouTube Shorts 的直式短影音（1080×1920、含燒錄字幕、繁中配音）。
 
+## 📺 範例輸出 / Sample Output
+
+本工具實際運行的 YouTube 頻道：
+
+**Stocks500** → https://www.youtube.com/@stocks500yt
+
+> 每週定期發布台股財經分析 Shorts，
+> 所有影片均由本工具自動生成。
+
 ## 功能
 
 - **AI 腳本生成**：Gemini 2.5 Flash 全自動生成繁體中文財報分析旁白、視覺提示詞、hashtag
@@ -126,3 +135,8 @@ yt-shorts-finance/
 - `output/` 資料夾含影片檔案，建議加入 `.gitignore`
 - Mixkit 素材透過 CDN 爬蟲取得，無需 API 金鑰
 - YouTube 上傳首次需完成 OAuth 瀏覽器授權流程
+
+## 🔗 相關連結
+
+- YouTube 頻道：https://www.youtube.com/@stocks500yt
+- 如果這個專案對你有幫助，歡迎訂閱頻道支持！
