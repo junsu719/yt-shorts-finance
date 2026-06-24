@@ -1,0 +1,43 @@
+# 虛擬環境
+venv/
+
+# API 金鑰與憑證（絕對不可上傳）
+config/
+.env
+
+# 影片輸出（檔案太大）
+output/
+charts/
+
+# 音訊暫存
+audio/
+assets/audio/
+
+# 自訂照片（個人隱私）
+assets/custom/
+
+# Python 快取
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# 暫存與日誌
+logs/
+*.log
+*.tmp
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 測試產生的暫存影片
+*.tiled.mp4
