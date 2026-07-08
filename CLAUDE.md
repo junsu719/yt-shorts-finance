@@ -1,4 +1,45 @@
-# YT Shorts Finance — 繁體中文財經短影音自動化系統
+# stocks500yt — 影片自動化 Pipeline 專案規範
+
+> 部署位置:WSL2 ~/yt-shorts-finance/CLAUDE.md(GitHub: junsu719/yt-shorts-finance)
+
+## 已確認目標
+- 解決:幫台灣人看懂財經新聞(教育型,非投顧)
+- 頻道:@stocks500yt,台股優先 + S&P 500 財報
+- 內容紅線與風格:一律遵循 ~/claude-bible/skills/yt-shorts-style/SKILL.md
+
+## 執行環境
+- WSL2 Ubuntu,`cd ~/yt-shorts-finance && source venv/bin/activate` 後才進 claude
+- 互動模式:`python main_confirm.py`(逐步確認);全自動:`python main.py`
+- Mac mini M4 為 24/7 排程候選機
+
+## 架構地圖
+- scripts/content_gen.py:Gemini 腳本生成,[CHART1~3] 標記(JSON mode + retry 已補)
+- scripts/tts.py:TTS + 標記剝離 + narration_charts.json
+- scripts/slot_allocator.py:SRT 時間戳 slot 分配(10~12 秒輪動)
+- scripts/video_gen.py:四庫素材下載(去重 + _BLOCKED_KEYWORDS)
+- scripts/assembler.py:FFmpeg 組裝
+- scripts/make_segments.py:長片分段出片(16:9,CapCut 組裝)
+- steps/step2_charts.py:三種動畫圖表模板(vertical / horizontal / diverging bar)
+- assets/custom/:自製素材(如 micron.jpg、memory_frog.jpg)
+
+> ⚠️ **待查證(2026-07-04 部署聖經時發現)**:本節與下方「YT Shorts Finance 技術規格書」的 Stage 說明並不完全對得上,且 repo 內還有 `main_confirm.py`(完整依賴 `steps/step1_script.py`~`step5_upload.py`)、根目錄 `make_segments.py`(16:9 長片工具)、`stage2~4_risk_edu_*.py`、`diagnose_clips.py` 等模組,目前**完全沒有任何文件描述**。已確認 `main.py` 第21行有 `from scripts.slot_allocator import build_slot_plan, print_slot_table`,證實 slot_allocator 確實整合進主產線,但下方技術規格書的 Stage 3 說明漏了它。這代表現有文件只完整涵蓋 `main.py` 這條 Shorts 產線,`main_confirm.py`/長片工具/risk_edu 系列仍待補寫或確認是否為現役。列為待辦,見專案 `DECISIONS.md`。
+
+## 技術鐵則
+- 中文字型:FontProperties(fname="/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc")
+- moviepy 版本鎖定(1.x/2.x 語法不相容)
+- 字幕 FontSize 80 + 自動換行,防溢出
+- 真實財務數據 = Firecrawl 抓取;Gemini 不得生成數字(詳細機制見下方技術規格書「Stage 0 — 資料查證」)
+- fallback 抓取必須傳遞 clip_duration,不得寫死 5 秒;圖表時長不做整數捨入
+- 新離題素材出現 → 即時追加 _BLOCKED_KEYWORDS 並回報
+
+## 資源
+- Kling AI:660 credits/月,留給高價值動態片段
+- 素材四庫:Pixabay + Pexels + Mixkit + Vecteezy(前兩者關鍵字組必須都給)
+- 週節奏參考(非硬性配額):週一盤前展望 / 週三教育 / 週五週回顧
+
+---
+
+# YT Shorts Finance — 繁體中文財經短影音自動化系統(技術規格書)
 
 自動產生台股 / S&P 500 財報分析、市場行情、AI 產業動態的 YouTube Shorts 影片。
 輸入主題字串，輸出可上傳的直式短影音（1080×1920、含燒錄字幕、繁中配音）。
@@ -38,6 +79,7 @@
 yt-shorts-finance/
 ├── main.py                   # 主程式；argparse CLI + 4 段 pipeline
 ├── custom_narration.txt      # （選用）手動覆蓋 AI 旁白，用後需刪除
+├── research_data.txt         # （選用）Firecrawl 抓取的已驗證財經資料，供 Gemini 撰寫文案用，用後需刪除
 │
 ├── scripts/
 │   ├── content_gen.py        # Stage 1：Gemini 2.5 Flash 生成腳本 JSON
@@ -94,6 +136,7 @@ yt-shorts-finance/
 | **YouTube Data API v3** | 影片上傳（OAuth2） | 已整合 | `config/client_secret.json` |
 | **FFmpeg / FFprobe** | 影片剪輯、縮放、字幕燒錄、音訊合併 | 已整合 | 系統環境 |
 | **Kling AI** | AI 影片生成（JWT 認證已測試） | 測試中 | `KLING_API_KEY/SECRET` in `.env` |
+| **Firecrawl MCP** | 即時搜尋/擷取真實財經數據，防止 Gemini 憑記憶捏造數字 | 已整合 | Claude Code MCP server，無需 `.env` 設定 |
 
 ---
 
@@ -107,10 +150,44 @@ python main.py "台積電最新財報分析"
 python main.py --topic "GTC Taipei 演講重點" --custom-photos "slot2:jensen.jpg"
 ```
 
+### Stage 0 — 資料查證（Firecrawl，防止數字幻覺）
+
+**職責分離：Firecrawl 負責數字正確性，Gemini 只負責文案撰寫。**
+Gemini 2.5 Flash 沒有即時資料，若直接要求它「生成財報數字」必然依賴訓練資料或憑空
+捏造。為避免此風險，具體數字一律先由 Firecrawl 查證，Gemini 只把已驗證的數字寫成
+有起承轉合的旁白。
+
+**完整流程：**
+1. 決定本集主題（例：「台積電 2026Q1 財報分析」）
+2. 用 Firecrawl MCP 工具（`firecrawl_search` / `firecrawl_scrape` / `firecrawl_extract`）
+   抓取公開財報、法說會新聞、股價等真實資料 —— 這一步發生在對話層（Claude Code
+   agent 手動執行），不是 Python pipeline 裡的程式碼
+3. 把抓到的資料整理成條列文字，寫入專案根目錄 `research_data.txt`
+4. 執行 `python main.py "主題"` → Stage 1 自動讀取 `research_data.txt`
+5. `content_gen.py` 把內容塞進 Gemini prompt 的 `{research}` 區塊，並附上規則：
+   - 只能使用 `research_data.txt` 裡的數字，禁止使用訓練資料或記憶中的舊數字
+   - 查無資料的項目一律用質化描述帶過（例如「本季獲利表現穩健」），絕不可捏造
+   - `chart_data` 每個數值都要對應到 `research_data.txt`，對不上就留空陣列 `[]`
+6. 完成後刪除 `research_data.txt`（同 `custom_narration.txt` 慣例，避免影響下次執行）
+
+`research_data.txt` 不存在時：Gemini 會收到「未提供已驗證研究資料，禁止捏造具體
+數字」的提示，旁白全部改用質化描述——安全網會擋下假數字，但也代表這支影片不會有
+具體財報數字，請務必先完成這一步再製作財報類影片。
+
+> 補充（2026-07-04 查證）：`scripts/content_gen.py` 呼叫 Gemini 時只設定
+> `genai.types.GenerationConfig(response_mime_type="application/json")`（JSON mode），
+> **沒有設定任何 `tools=[...]` 或 Google Search grounding 工具**，程式碼層級確認未使用
+> Gemini 內建 grounding，與上述「Gemini 只負責文案撰寫」的原則一致。
+
+---
+
 ### Stage 1 — 腳本生成 (`scripts/content_gen.py`)
 
 - 若 `custom_narration.txt` 存在 → 使用手動旁白，AI 僅補充 title / search_queries / hashtags
-- 否則 → Gemini 2.5 Flash 全自動生成完整腳本
+- 否則 → 讀取 `research_data.txt`（見 Stage 0），連同主題一起交給 Gemini 2.5 Flash 生成完整腳本
+  - `research_data.txt` 不存在時，Gemini 改用質化描述，不會捏造具體數字
+- Gemini 呼叫：JSON mode（`response_mime_type=application/json`）+ retry 3 次（指數退避 2s/4s）
+- 必填欄位驗證（title / narration / search_queries）：缺漏或型別錯誤時套用安全預設值，不中斷 pipeline
 - 輸出：`output/<id>/script.json`
 
 **旁白命名規則（prompt 內建）：**
@@ -271,6 +348,19 @@ EOF
 python main.py "主題名稱"
 rm custom_narration.txt
 
+# ── 使用 Firecrawl 已驗證財經資料（防止數字幻覺，財報類影片建議必做）──────────
+# 1. 先用 Firecrawl MCP 工具抓取真實數字，整理成條列文字寫入 research_data.txt
+cat > research_data.txt << 'EOF'
+- 營收：新台幣592億元，年增3.2%（來源：公開財報 2026Q1）
+- 毛利率：53.1%
+- EPS：8.7元
+- 法說會重點：下季展望維持審慎樂觀
+EOF
+# 2. 製作時 Stage 1 會自動讀取，Gemini 只會用這些數字撰寫文案
+python main.py "台積電 2026Q1 財報分析"
+# 3. 完成後刪除，避免影響下次執行
+rm research_data.txt
+
 # ── 插入自訂照片 ──────────────────────────────────────────────────────────
 # 1. 把照片放進 assets/custom/
 cp ~/Downloads/jensen.jpg assets/custom/
@@ -302,4 +392,4 @@ python -c "import matplotlib; print(matplotlib.__version__)"
 - YouTube 上傳需先完成 OAuth 授權（`config/client_secret.json`）
 - Vecteezy API key 需加入 `config/.env`（`VECTEEZY_API_KEY=...`）
 - Mixkit 爬蟲依賴 CDN URL regex，若 Mixkit 改版可能需更新 `video_gen.py` 的 patterns
-- 輸出路徑：`/mnt/d/yt-shorts-finance/output/`（D 槽）
+- 輸出路徑：`/mnt/d/yt-shorts-finance/output/`(D 槽)
