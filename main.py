@@ -13,9 +13,12 @@ from scripts.image_gen import generate_image, image_to_clip
 from scripts.chart_gen import (
     generate_finance_chart, chart_to_clip, CHART_TYPES,
     generate_market_chart, generate_education_chart,
+    generate_animated_chart, generate_animated_market_chart,
+    generate_etf_dividend_chart, generate_highlight_bar_chart,
 )
 from scripts.assembler import concat_clips, assemble
 from scripts.photo_gen import photo_to_clip, CUSTOM_DIR
+from scripts.slot_allocator import build_slot_plan, print_slot_table
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +45,7 @@ def detect_content_type(script: dict, topic: str = "") -> str:
     ).lower()
 
     # ── Step 1: education detection — topic takes broad list ─────────────────
-    topic_edu = ["如何", "教學", "什麼是", "怎麼看", "入門", "新手", "基礎", "怎麼", "how to"]
+    topic_edu = ["如何", "教學", "什麼是", "是什麼", "怎麼看", "入門", "新手", "基礎", "怎麼", "搞懂", "how to"]
     if any(k in topic_l for k in topic_edu):
         return "education"
 
@@ -64,45 +67,11 @@ def detect_content_type(script: dict, topic: str = "") -> str:
 
     # ── Step 3: earnings — single company with financial data ─────────────────
     chart_data = script.get("chart_data") or {}
-    if chart_data.get("revenue"):
+    if chart_data.get("revenue") or chart_data.get("eps"):
         return "earnings"
 
     return "market"
 
-
-# ── Slot plans (7 clips, all 4 video sources covered per plan) ────────────────
-#   type='chart'  → matplotlib chart (3-tier fallback built in)
-#   type='video'  → fetch_clip from the named source
-
-_SLOT_PLANS: dict[str, list[dict]] = {
-    "earnings": [                        # 2 charts + 5 videos
-        {"type": "video", "source": "pexels"},
-        {"type": "chart"},
-        {"type": "video", "source": "pixabay"},
-        {"type": "chart"},
-        {"type": "video", "source": "mixkit"},
-        {"type": "video", "source": "vecteezy"},
-        {"type": "video", "source": "pexels"},
-    ],
-    "market": [                          # 1 chart + 6 videos
-        {"type": "video", "source": "pexels"},
-        {"type": "video", "source": "pixabay"},
-        {"type": "chart"},
-        {"type": "video", "source": "mixkit"},
-        {"type": "video", "source": "vecteezy"},
-        {"type": "video", "source": "pexels"},
-        {"type": "video", "source": "pixabay"},
-    ],
-    "education": [                       # 3 charts + 4 videos
-        {"type": "video", "source": "pexels"},
-        {"type": "chart"},
-        {"type": "video", "source": "pixabay"},
-        {"type": "chart"},
-        {"type": "video", "source": "mixkit"},
-        {"type": "chart"},
-        {"type": "video", "source": "vecteezy"},
-    ],
-}
 
 
 def _parse_custom_photos(spec: str) -> dict[int, Path]:
@@ -152,7 +121,18 @@ def run(topic: str, custom_photos: dict[int, Path] | None = None) -> str:
         )
         if narration_override:
             log.info("  使用 custom_narration.txt")
-        script = generate_script(topic, narration_override=narration_override)
+
+        research_data_path = Path("research_data.txt")
+        research_data = (
+            research_data_path.read_text(encoding="utf-8")
+            if research_data_path.exists() else None
+        )
+        if research_data:
+            log.info("  使用 research_data.txt（已驗證財經資料，供 Gemini 撰寫文案用）")
+        elif not narration_override:
+            log.warning("  找不到 research_data.txt，Gemini 將無數字來源，旁白會改用質化描述")
+
+        script = generate_script(topic, narration_override=narration_override, research_data=research_data)
     (work / "script.json").write_text(
         json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -160,9 +140,10 @@ def run(topic: str, custom_photos: dict[int, Path] | None = None) -> str:
 
     # 2. TTS + SRT
     log.info("[2/4] 語音合成...")
-    audio_path = str(work / "narration.mp3")
-    srt_path   = str(work / "narration.srt")
-    duration   = synthesize(script["narration"], audio_path, srt_path=srt_path)
+    audio_path  = str(work / "narration.mp3")
+    srt_path    = str(work / "narration.srt")
+    charts_path = str(work / "narration_charts.json")
+    duration    = synthesize(script["narration"], audio_path, srt_path=srt_path, charts_path=charts_path)
     _nar_chars = len(script["narration"].replace(" ", "").replace("\n", ""))
     log.info(f"  旁白字數：{_nar_chars} 字 | 預估秒數：約 {_nar_chars // 5}s（實際 {duration:.0f}s）")
 
@@ -172,10 +153,11 @@ def run(topic: str, custom_photos: dict[int, Path] | None = None) -> str:
     content_type = detect_content_type(script, topic)
     log.info(f"  題材類型：{content_type}")
 
-    slot_plan      = _SLOT_PLANS[content_type]
-    total_slots    = len(slot_plan)
-    chart_data     = script.get("chart_data") or {}
-    use_charts     = bool(chart_data.get("revenue"))
+    chart_data  = script.get("chart_data") or {}
+    use_charts  = bool(
+        chart_data.get("revenue") or chart_data.get("eps") or
+        chart_data.get("segments") or chart_data.get("yoy_growth")
+    )
 
     # Inject nonfarm education data when topic/narration matches
     _nonfarm_kws = ["非農", "nonfarm", "non-farm", "就業報告"]
@@ -195,27 +177,37 @@ def run(topic: str, custom_photos: dict[int, Path] | None = None) -> str:
         }
         use_charts = False
         log.info("  偵測到非農教育題材，注入自訂圖表資料")
+
+    _etf_div_kws = ["配息", "0050", "0056", "除息"]
+    _is_etf_edu = content_type == "education" and any(
+        k in (topic + _narration_text) for k in _etf_div_kws
+    )
+    if _is_etf_edu:
+        log.info("  偵測到ETF配息教育題材，啟用配息圖表")
     narration      = script.get("narration", "")
     search_queries = script.get("search_queries") or script.get("visual_prompts", [])
     chart_types    = CHART_TYPES.copy()
     random.shuffle(chart_types)
 
+    slot_plan = build_slot_plan(srt_path, charts_path, search_queries, content_type)
+    print_slot_table(slot_plan, duration, topic)
+    log.info(f"  Slot 數量：{len(slot_plan)}（動態分配）")
+
     clip_paths:   list[str]      = []
     seen_ids:     set[str]       = set()
     seen_hashes:  set[str]       = set()
     source_stats: dict[str, int] = {"pexels": 0, "pixabay": 0, "mixkit": 0, "vecteezy": 0, "chart": 0, "custom": 0}
-    chart_idx  = 0
-    video_idx  = 0
+    chart_idx = 0
 
     if custom_photos:
         log.info(f"  自訂照片：{', '.join(f'slot{k}={v.name}' for k, v in sorted(custom_photos.items()))}")
 
-    for slot_num, slot_spec in enumerate(slot_plan):
-        clip_path = str(work / f"clip_{slot_num+1:02d}.mp4")
-        label     = f"Slot {slot_num+1}/{total_slots}"
+    for spec in slot_plan:
+        clip_path = str(work / f"clip_{spec.index:02d}.mp4")
+        label     = f"Slot {spec.index}/{len(slot_plan)}"
 
         # ── Custom photo override ─────────────────────────────────────────
-        custom_path = (custom_photos or {}).get(slot_num + 1)
+        custom_path = (custom_photos or {}).get(spec.index)
         if custom_path is not None:
             if custom_path.exists():
                 try:
@@ -230,64 +222,90 @@ def run(topic: str, custom_photos: dict[int, Path] | None = None) -> str:
                 log.warning(f"  {label}: 找不到照片 '{custom_path.name}'（{custom_path}），改用素材庫備援")
         # ─────────────────────────────────────────────────────────────────
 
-        if slot_spec["type"] == "chart":
+        if spec.type == "chart":
+            # Education charts still use static PNG → chart_to_clip
             chart_png     = str(work / f"chart_{chart_idx+1:02d}.png")
             chart_success = False
+            chart_dur     = spec.duration
 
             if _is_nonfarm_edu:
                 _edu_labels = ["非農比較圖", "好消息壞消息流程圖", "台股走勢示意圖"]
                 _edu_label  = _edu_labels[chart_idx % len(_edu_labels)]
                 try:
                     generate_education_chart(chart_data, chart_idx, chart_png)
-                    chart_to_clip(chart_png, clip_path, duration=5)
+                    chart_to_clip(chart_png, clip_path, duration=chart_dur)
                     log.info(f"  {label}: 教育圖表 [{_edu_label}]")
                     chart_success = True
                 except Exception as e:
-                    log.warning(f"  {label}: 教育圖表失敗，嘗試市場圖表: {e}")
+                    log.warning(f"  {label}: 教育圖表失敗，嘗試動畫圖表: {e}")
 
+            # ETF education charts — list of horizontal-bar specs dispatched by chart_idx
+            if not chart_success and _is_etf_edu:
+                _etf_charts = chart_data.get("etf_charts", [])
+                if chart_idx < len(_etf_charts):
+                    cfg = _etf_charts[chart_idx]
+                    try:
+                        generate_highlight_bar_chart(
+                            data=cfg["data"], labels=cfg["labels"],
+                            title=cfg["title"], unit=cfg.get("unit", ""),
+                            highlight_index=cfg.get("highlight_index", 0),
+                            output_path=clip_path,
+                            watermark=cfg.get("watermark", "示意圖，非投資建議"),
+                            duration=chart_dur,
+                        )
+                        log.info(f"  {label}: ETF教育圖表 [{cfg['title']}]")
+                        chart_success = True
+                    except Exception as e:
+                        log.warning(f"  {label}: ETF教育圖表失敗: {e}")
+
+            # Animated finance chart — outputs MP4 directly to clip_path
             if not chart_success and use_charts:
                 chart_type = chart_types[chart_idx % len(chart_types)]
                 try:
-                    generate_finance_chart(chart_data, chart_type, chart_png)
-                    chart_to_clip(chart_png, clip_path, duration=5)
-                    log.info(f"  {label}: 公司圖表 [{chart_type}]")
+                    generate_animated_chart(chart_data, chart_type, clip_path, duration=chart_dur)
+                    log.info(f"  {label}: 動畫圖表 [{chart_type}]")
                     chart_success = True
                 except Exception as e:
-                    log.warning(f"  {label}: 財報圖表失敗，嘗試市場圖表: {e}")
+                    log.warning(f"  {label}: 動畫圖表失敗，嘗試動畫市場圖: {e}")
 
+            # Animated market chart fallback — chart_idx rotates chart type
             if not chart_success:
                 try:
-                    generate_market_chart(narration, chart_png)
-                    chart_to_clip(chart_png, clip_path, duration=5)
-                    log.info(f"  {label}: 市場指數圖表")
+                    generate_animated_market_chart(narration, clip_path, duration=chart_dur, chart_idx=chart_idx, chart_data=chart_data)
+                    log.info(f"  {label}: 動畫市場圖表 [type={chart_idx % 3}]")
                     chart_success = True
                 except Exception as e:
-                    log.warning(f"  {label}: 市場圖表失敗，改用影片素材: {e}")
+                    log.warning(f"  {label}: 動畫市場圖表失敗，改用影片素材: {e}")
 
             if not chart_success:
-                q = search_queries[chart_idx % len(search_queries)] if search_queries else "stock market"
-                fetch_clip(q, clip_path, source="auto", seen_ids=seen_ids, seen_hashes=seen_hashes)
-                log.info(f"  {label}: 影片備援 query='{q}'")
+                q = spec.query or (search_queries[chart_idx % len(search_queries)] if search_queries else "stock market")
+                try:
+                    fetch_clip(q, clip_path, source="auto", seen_ids=seen_ids, seen_hashes=seen_hashes,
+                               clip_duration=spec.duration)
+                    log.info(f"  {label}: 影片備援 query='{q}'")
+                except Exception as e:
+                    log.error(f"  {label}: 圖表與影片備援皆失敗，改用純色底: {e}")
 
             source_stats["chart"] += 1
             chart_idx += 1
 
         else:
-            source = slot_spec["source"]
-            q      = search_queries[video_idx % len(search_queries)] if search_queries else "stock market"
             try:
-                fetch_clip(q, clip_path, source=source, seen_ids=seen_ids, seen_hashes=seen_hashes)
-                log.info(f"  {label}: 影片 [{source}] query='{q}'")
-                source_stats[source] += 1
+                fetch_clip(spec.query, clip_path, source=spec.source,
+                           seen_ids=seen_ids, seen_hashes=seen_hashes,
+                           clip_duration=spec.duration)
+                log.info(f"  {label}: 影片 [{spec.source}] query='{spec.query}'")
+                source_stats[spec.source] += 1
             except Exception as e:
-                log.warning(f"  {label}: [{source}] 失敗，改用 auto: {e}")
+                log.warning(f"  {label}: [{spec.source}] 失敗，改用 auto: {e}")
                 try:
-                    fetch_clip(q, clip_path, source="auto", seen_ids=seen_ids, seen_hashes=seen_hashes)
-                    log.info(f"  {label}: 影片 [auto fallback] query='{q}'")
+                    fetch_clip(spec.query, clip_path, source="auto",
+                               seen_ids=seen_ids, seen_hashes=seen_hashes,
+                               clip_duration=spec.duration)
+                    log.info(f"  {label}: 影片 [auto fallback] query='{spec.query}'")
                     source_stats["auto_fallback"] = source_stats.get("auto_fallback", 0) + 1
                 except Exception as e2:
                     log.error(f"  {label}: 影片完全失敗: {e2}")
-            video_idx += 1
 
         clip_paths.append(clip_path)
 
@@ -301,7 +319,8 @@ def run(topic: str, custom_photos: dict[int, Path] | None = None) -> str:
     log.info(f"  素材統計：{' | '.join(parts)}")
 
     bg_video = str(work / "background.mp4")
-    concat_clips(clip_paths, bg_video)
+    clip_durations = [s.duration for s in slot_plan]
+    concat_clips(clip_paths, bg_video, clip_durations)
 
     # 4. Assemble final video
     log.info("[4/4] 合成最終影片...")

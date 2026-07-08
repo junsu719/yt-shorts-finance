@@ -6,6 +6,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.animation as _manim
 from matplotlib import font_manager as _fm
 
 # Register Noto Sans CJK so Chinese/Traditional text renders correctly
@@ -534,9 +535,9 @@ def generate_finance_chart(chart_data: dict, chart_type: str, output_path: str):
     func(chart_data, output_path)
 
 
-def chart_to_clip(chart_path: str, output_path: str, duration: int = 5):
+def chart_to_clip(chart_path: str, output_path: str, duration: float = 5):
     """Convert a PNG chart to a 9:16 MP4 with a subtle Ken Burns zoom."""
-    total_frames = duration * 30
+    total_frames = int(round(duration * 30))
     subprocess.run(
         [
             "ffmpeg", "-y", "-loop", "1", "-i", chart_path,
@@ -557,3 +558,563 @@ def chart_to_clip(chart_path: str, output_path: str, duration: int = 5):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Animated chart API — portrait 1080×1920 MP4 for Shorts pipeline
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _anim_writer():
+    return _manim.FFMpegWriter(fps=30, codec="libx264",
+                                extra_args=["-pix_fmt", "yuv420p"])
+
+
+def _anim_ease_out(t: float) -> float:
+    t = max(0.0, min(1.0, t))
+    return 1.0 - (1.0 - t) ** 3
+
+
+def _anim_ease_in_out(t: float) -> float:
+    t = max(0.0, min(1.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _anim_fmt(val: float) -> str:
+    if abs(val) >= 1000:
+        return f"{val:,.0f}"
+    if abs(val) >= 10:
+        return f"{val:.1f}"
+    return f"{val:.2f}"
+
+
+def _portrait_fig():
+    """1080×1920 portrait figure — matches chart_gen.py's static chart dimensions."""
+    fig, ax = plt.subplots(figsize=(6, 10.67), dpi=180)
+    fig.patch.set_facecolor(_BG)
+    ax.set_facecolor(_BG)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    return fig, ax
+
+
+# ── Animated Vertical Bar (6 s / 180 frames) ─────────────────────────────────
+
+def _anim_vertical_bar(
+    data: list, labels: list, title: str, unit: str,
+    color: str, output_path: str, duration: float = 6,
+    bar_colors: list | None = None,
+    watermark_text: str = "",
+    annotation_idx: int = -1,
+    annotation_text: str = "",
+) -> None:
+    """
+    Portrait 1080×1920 vertical bar animation.
+    0–30f  : X-axis draws left→right
+    30–120f: bars grow bottom-up, staggered 0.2 s / 6 frames each
+    120–160f: value labels count 0→final
+    160–180f: trend line draws left→right
+    """
+    n       = len(data)
+    y_max   = max(data) * 1.3
+    TOTAL   = int(round(duration * 30))        # 180
+    STAGGER = 6
+    BAR_DUR = max(12, (90 - (n - 1) * STAGGER))
+
+    fig, ax = _portrait_fig()
+    ax.set_xlim(-0.6, n - 0.4)
+    ax.set_ylim(0, y_max)
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(labels, color=_GRAY, fontsize=8)
+    ax.tick_params(colors=_GRAY, length=0)
+    ax.set_yticks([])
+    ax.set_title(title, fontsize=11, fontweight="bold", color=_TEXT, pad=14)
+    if unit:
+        ax.set_ylabel(unit, fontsize=8, color=_GRAY, labelpad=6)
+    if watermark_text:
+        fig.text(0.5, 0.015, watermark_text, ha="center", fontsize=7, color=_GRAY, alpha=0.5)
+
+    for gv in np.linspace(0, y_max * 0.8, 4):
+        ax.axhline(gv, color=_GRID, linewidth=0.5, alpha=0.4)
+
+    x_axis, = ax.plot([], [], color=_GRAY, linewidth=1.2, alpha=0.6)
+    actual_colors = bar_colors if (bar_colors and len(bar_colors) == n) else [color] * n
+    bars = ax.bar(range(n), [0.0] * n, color=actual_colors, alpha=0.85,
+                  width=0.55, edgecolor=_BG, linewidth=0.8)
+    val_txts = [
+        ax.text(i, 0, "", ha="center", va="bottom",
+                color=_TEXT, fontsize=9, fontweight="bold")
+        for i in range(n)
+    ]
+    trend_line, = ax.plot([], [], color=_BLUE, linewidth=2.0,
+                          linestyle="--", alpha=0.85, zorder=5)
+    trend_dots, = ax.plot([], [], "o", color=_BLUE, markersize=5, zorder=6)
+
+    _anno_art = None
+    if 0 <= annotation_idx < n and annotation_text:
+        _anno_col = (actual_colors[annotation_idx]
+                     if actual_colors and annotation_idx < len(actual_colors)
+                     else _TEXT)
+        _anno_art = ax.text(
+            annotation_idx,
+            data[annotation_idx] + y_max * 0.10,
+            annotation_text,
+            ha="center", va="bottom",
+            color=_anno_col, fontsize=7, fontweight="bold",
+            linespacing=1.3, zorder=7,
+            bbox=dict(facecolor=_BG, edgecolor=_anno_col,
+                      boxstyle="round,pad=0.25", linewidth=1.5),
+            visible=False,
+        )
+
+    def update(frame):
+        # Phase 1: x-axis
+        if frame < 30:
+            x_axis.set_data([-0.5, -0.5 + (frame / 30.0) * (n + 0.5)], [0, 0])
+        else:
+            x_axis.set_data([-0.5, n - 0.5], [0, 0])
+
+        # Phase 2: bars
+        for i, (bar, val) in enumerate(zip(bars, data)):
+            t0 = 30 + i * STAGGER
+            t1 = t0 + BAR_DUR
+            frac = 0.0 if frame < t0 else (1.0 if frame >= t1
+                   else _anim_ease_out((frame - t0) / BAR_DUR))
+            bar.set_height(max(val * frac, 0.0))
+
+        # Phase 3: labels
+        for i, (txt, val) in enumerate(zip(val_txts, data)):
+            done = 30 + i * STAGGER + BAR_DUR
+            if frame < max(done, 120):
+                txt.set_text("")
+            else:
+                p = _anim_ease_out(min((frame - 120) / 40.0, 1.0))
+                txt.set_text(_anim_fmt(val * p))
+                txt.set_position((i, bars[i].get_height() + y_max * 0.015))
+
+        # Phase 4: trend line
+        if frame >= 160:
+            p    = min((frame - 160) / 20.0, 1.0)
+            nseg = p * (n - 1)
+            nf   = int(nseg)
+            frac = nseg - nf
+            xs = list(range(nf + 1))
+            ys = list(data[:nf + 1])
+            if frac > 0 and nf < n - 1:
+                xs.append(nf + frac)
+                ys.append(data[nf] + frac * (data[nf + 1] - data[nf]))
+            trend_line.set_data(xs, ys)
+            trend_dots.set_data(list(range(nf + 1)), data[:nf + 1])
+        else:
+            trend_line.set_data([], [])
+            trend_dots.set_data([], [])
+
+        if _anno_art is not None:
+            _anno_art.set_visible(frame >= 130)
+
+    anim = _manim.FuncAnimation(fig, update, frames=TOTAL, interval=1000 / 30)
+    anim.save(output_path, writer=_anim_writer())
+    plt.close(fig)
+
+
+# ── Animated Horizontal Bar (5 s / 150 frames) ───────────────────────────────
+
+def _anim_horizontal_bar(
+    data: list, labels: list, title: str,
+    highlight_index: int, unit: str,
+    output_path: str, duration: float = 5,
+    watermark_text: str = "",
+) -> None:
+    """
+    Portrait 1080×1920 horizontal bar animation.
+    0–20f  : background
+    20–110f: bars extend left→right, staggered 0.3 s / 9 frames each
+    110–130f: value labels appear
+    130–150f: annotation box flies in from right
+    """
+    n       = len(data)
+    x_max   = max(data) * 1.35
+    TOTAL   = int(round(duration * 30))        # 150
+    STAGGER = 9
+    BAR_DUR = max(12, (90 - (n - 1) * STAGGER))
+    hi      = highlight_index
+
+    fig, ax = _portrait_fig()
+    ax.set_xlim(0, x_max)
+    ax.set_ylim(-0.55, n - 0.45)
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(labels, color=_GRAY, fontsize=9)
+    ax.tick_params(colors=_GRAY, length=0)
+    ax.set_xticks([])
+    ax.set_title(title, fontsize=11, fontweight="bold", color=_TEXT, pad=14)
+    if watermark_text:
+        fig.text(0.5, 0.015, watermark_text, ha="center", fontsize=7, color=_GRAY, alpha=0.5)
+
+    palette  = [_GREEN, _BLUE, "#f0883e", "#bc8cff", _GRAY]
+    bar_cols = [
+        "#f0883e" if i == hi else palette[i % len(palette)]
+        for i in range(n)
+    ]
+    bars = ax.barh(range(n), [0.0] * n, color=bar_cols,
+                   edgecolor=_BG, linewidth=0.8, height=0.55)
+    val_txts = [
+        ax.text(0, i, "", ha="left", va="center",
+                color=_TEXT, fontsize=9, fontweight="bold")
+        for i in range(n)
+    ]
+    _anno_x0 = x_max * 1.6
+    _anno_x1 = data[hi] + x_max * 0.03
+    anno = ax.text(
+        _anno_x0, hi, f"★  {_anim_fmt(data[hi])}{unit}",
+        ha="left", va="center", color="#f0883e",
+        fontsize=9, fontweight="bold",
+        bbox=dict(facecolor=_BG, edgecolor="#f0883e",
+                  boxstyle="round,pad=0.3", linewidth=1.5),
+    )
+
+    def update(frame):
+        for i, (bar, val) in enumerate(zip(bars, data)):
+            t0   = 20 + i * STAGGER
+            t1   = t0 + BAR_DUR
+            frac = (0.0 if frame < t0 else
+                    1.0 if frame >= t1 else
+                    _anim_ease_out((frame - t0) / BAR_DUR))
+            bar.set_width(max(val * frac, 0.0))
+
+        for i, (txt, val) in enumerate(zip(val_txts, data)):
+            if frame < 110:
+                txt.set_text("")
+            else:
+                p = _anim_ease_out(min((frame - 110) / 20.0, 1.0))
+                txt.set_text(f"{_anim_fmt(val * p)}{unit}")
+                txt.set_position((bars[i].get_width() + x_max * 0.01, i))
+
+        if frame >= 130:
+            p = _anim_ease_in_out(min((frame - 130) / 20.0, 1.0))
+            anno.set_position((_anno_x0 + (_anno_x1 - _anno_x0) * p, hi))
+
+    anim = _manim.FuncAnimation(fig, update, frames=TOTAL, interval=1000 / 30)
+    anim.save(output_path, writer=_anim_writer())
+    plt.close(fig)
+
+
+# ── Animated Diverging Bar (7 s / 210 frames) ────────────────────────────────
+
+def _anim_diverging_bar(
+    data: list, labels: list, title: str, unit: str,
+    output_path: str, duration: float = 7,
+    watermark_text: str = "",
+) -> None:
+    """
+    Portrait 1080×1920 diverging bar animation.
+    0–30f   : zero axis draws left→right
+    30–90f  : negative bars grow downward
+    90–150f : positive bars grow upward
+    150–180f: turning-point annotation appears
+    180–210f: annotation blinks ×3
+    """
+    n       = len(data)
+    abs_max = max(abs(min(data, default=0)), abs(max(data, default=1)), 1.0)
+    y_range = abs_max * 1.4
+    TOTAL   = int(round(duration * 30))     # 210
+
+    neg_idx = [i for i, v in enumerate(data) if v < 0]
+    pos_idx = [i for i, v in enumerate(data) if v >= 0]
+    NEG_S   = max(4, 50 // max(len(neg_idx), 1))
+    NEG_D   = max(12, 60 - (len(neg_idx) - 1) * NEG_S)
+    POS_S   = max(4, 50 // max(len(pos_idx), 1))
+    POS_D   = max(12, 60 - (len(pos_idx) - 1) * POS_S)
+
+    turn_idx = next(
+        (i for i in range(1, n) if data[i - 1] < 0 and data[i] >= 0),
+        pos_idx[0] if pos_idx else None,
+    )
+
+    fig, ax = _portrait_fig()
+    ax.set_xlim(-0.6, n - 0.4)
+    ax.set_ylim(-y_range, y_range)
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(labels, color=_GRAY, fontsize=8)
+    ax.tick_params(colors=_GRAY, length=0)
+    ax.set_yticks([])
+    ax.set_title(title, fontsize=11, fontweight="bold", color=_TEXT, pad=14)
+    if watermark_text:
+        fig.text(0.5, 0.015, watermark_text, ha="center", fontsize=7, color=_GRAY, alpha=0.5)
+
+    zero_line, = ax.plot([], [], color=_GRAY, linewidth=1.5, alpha=0.7)
+    bar_cols = [_RED if v < 0 else _GREEN for v in data]
+    bars = ax.bar(range(n), [0.0] * n, bottom=0.0,
+                  color=bar_cols, alpha=0.85, width=0.55,
+                  edgecolor=_BG, linewidth=0.8)
+    val_txts = [
+        ax.text(i, 0, "", ha="center",
+                va="top" if v < 0 else "bottom",
+                color=_TEXT, fontsize=8, fontweight="bold")
+        for i, v in enumerate(data)
+    ]
+    anno = None
+    if turn_idx is not None:
+        anno = ax.text(
+            turn_idx, data[turn_idx] + y_range * 0.1,
+            "↑ 轉正", ha="center", va="bottom",
+            color=_BLUE, fontsize=9, fontweight="bold",
+            bbox=dict(facecolor=_BG, edgecolor=_BLUE,
+                      boxstyle="round,pad=0.3", linewidth=1.5),
+            visible=False,
+        )
+
+    def _set_bar(i, val, frac):
+        h = abs(val) * frac
+        if val < 0:
+            bars[i].set_y(-h)
+            bars[i].set_height(h)
+        else:
+            bars[i].set_y(0.0)
+            bars[i].set_height(h)
+
+    def update(frame):
+        # Phase 1: zero axis
+        if frame < 30:
+            zero_line.set_data([-0.5, -0.5 + (frame / 30.0) * n], [0, 0])
+        else:
+            zero_line.set_data([-0.5, n - 0.5], [0, 0])
+
+        # Phase 2: negative bars (30–90)
+        for j, i in enumerate(neg_idx):
+            t0   = 30 + j * NEG_S
+            t1   = t0 + NEG_D
+            frac = (0.0 if frame < t0 else 1.0 if frame >= t1
+                    else _anim_ease_out((frame - t0) / NEG_D))
+            _set_bar(i, data[i], frac)
+
+        # Phase 3: positive bars (90–150)
+        for j, i in enumerate(pos_idx):
+            t0   = 90 + j * POS_S
+            t1   = t0 + POS_D
+            frac = (0.0 if frame < t0 else 1.0 if frame >= t1
+                    else _anim_ease_out((frame - t0) / POS_D))
+            _set_bar(i, data[i], frac)
+
+        # Value labels
+        for j, (txt, val) in enumerate(zip(val_txts, data)):
+            if val < 0:
+                done = 30 + neg_idx.index(j) * NEG_S + NEG_D if j in neg_idx else 90
+            else:
+                done = 90 + pos_idx.index(j) * POS_S + POS_D if j in pos_idx else 150
+            if frame >= done:
+                sign = "+" if val >= 0 else ""
+                txt.set_text(f"{sign}{_anim_fmt(val)}{unit}")
+                off = y_range * 0.05
+                txt.set_position((j, val - off if val < 0 else val + off * 0.4))
+            else:
+                txt.set_text("")
+
+        # Phase 4 & 5: annotation
+        if anno:
+            if frame >= 150:
+                anno.set_visible(True)
+            if frame >= 180:
+                anno.set_visible((frame - 180) % 20 < 10)
+
+    anim = _manim.FuncAnimation(fig, update, frames=TOTAL, interval=1000 / 30)
+    anim.save(output_path, writer=_anim_writer())
+    plt.close(fig)
+
+
+# ── Public animated API ───────────────────────────────────────────────────────
+
+def generate_animated_chart(
+    chart_data: dict, chart_type: str, output_path: str, duration: float = 6,
+) -> None:
+    """
+    Replaces generate_finance_chart + chart_to_clip.
+    Outputs an animated portrait MP4 (1080×1920) directly to output_path.
+
+    Routing:
+      eps_trend / candlestick → vertical bar (EPS or revenue)
+      revenue_bar             → vertical bar (revenue)
+      segment_bar             → horizontal bar (segments)
+      gross_margin            → diverging bar (YoY growth)
+    """
+    company  = chart_data.get("company", "")
+    qtrs     = chart_data.get("quarters") or ["Q1", "Q2", "Q3", "Q4"]
+    currency = chart_data.get("currency", "")
+    unit_str = chart_data.get("unit", "")
+
+    if chart_type in ("eps_trend", "candlestick"):
+        raw  = chart_data.get("eps") or chart_data.get("revenue") or [1, 1.5, 2, 2.5]
+        data = [float(v) for v in raw[-8:]]
+        lbl  = qtrs[-len(data):]
+        _anim_vertical_bar(
+            data=data, labels=lbl,
+            title=f"{company} EPS 趨勢" if company else "EPS 趨勢",
+            unit=currency or "NT$",
+            color=_GREEN, output_path=output_path, duration=duration,
+        )
+
+    elif chart_type == "revenue_bar":
+        raw  = chart_data.get("revenue") or [100, 120, 140, 160]
+        data = [float(v) for v in raw[-8:]]
+        lbl  = qtrs[-len(data):]
+        _anim_vertical_bar(
+            data=data, labels=lbl,
+            title=f"{company} 季營收" if company else "季營收",
+            unit=unit_str or "億",
+            color=_GREEN, output_path=output_path, duration=duration,
+        )
+
+    elif chart_type == "segment_bar":
+        segs = chart_data.get("segments") or {"HPC": 52, "Mobile": 33, "IoT": 15}
+        vals = [float(v) for v in segs.values()]
+        hi   = int(np.argmax(vals))
+        _anim_horizontal_bar(
+            data=vals, labels=list(segs.keys()),
+            title=f"{company} 業務佔比" if company else "業務佔比",
+            highlight_index=hi, unit="%",
+            output_path=output_path, duration=duration,
+        )
+
+    elif chart_type == "gross_margin":
+        yoy  = chart_data.get("yoy_growth") or [-5, -2, 2, 5, 8, 12, 15, 18]
+        data = [float(v) for v in yoy[-8:]]
+        lbl  = qtrs[-len(data):]
+        _anim_diverging_bar(
+            data=data, labels=lbl,
+            title=chart_data.get("chart_title") or (f"{company} 營收年增率" if company else "營收年增率"),
+            unit="%", output_path=output_path, duration=duration,
+            watermark_text=chart_data.get("chart_watermark", ""),
+        )
+
+    else:
+        raise ValueError(f"Unknown chart_type '{chart_type}' for animated chart")
+
+
+def generate_quarterly_comparison_chart(
+    data: list, labels: list, title: str, unit: str,
+    highlight_index: int, output_path: str,
+    highlight_color: str = "#FFD700",
+    base_color: str = _BLUE,
+    watermark: str = "數據來源：台灣證券交易所",
+    duration: float = 6,
+    annotation: str = "",
+) -> None:
+    """Animated vertical bar chart with one highlighted bar (e.g. current quarter)."""
+    n = len(data)
+    bar_cols = [highlight_color if i == highlight_index else base_color for i in range(n)]
+    _anim_vertical_bar(
+        data=data, labels=labels, title=title, unit=unit,
+        color=base_color, output_path=output_path, duration=duration,
+        bar_colors=bar_cols, watermark_text=watermark,
+        annotation_idx=highlight_index if annotation else -1,
+        annotation_text=annotation,
+    )
+
+
+def generate_highlight_bar_chart(
+    data: list, labels: list, title: str, unit: str,
+    highlight_index: int, output_path: str,
+    watermark: str = "示意圖，非實際數據",
+    duration: float = 5,
+) -> None:
+    """Animated horizontal bar chart with one highlighted bar."""
+    _anim_horizontal_bar(
+        data=data, labels=labels, title=title,
+        highlight_index=highlight_index, unit=unit,
+        output_path=output_path, duration=duration,
+        watermark_text=watermark,
+    )
+
+
+def generate_etf_dividend_chart(chart_data: dict, output_path: str, duration: float = 5) -> None:
+    """Animated horizontal bar for ETF dividend per-unit comparison."""
+    div = chart_data.get("etf_dividend", {})
+    _anim_horizontal_bar(
+        data=div.get("data", [0.6, 1.35]),
+        labels=div.get("labels", ["0050 元大台灣50", "0056 元大高股息"]),
+        title=div.get("title", "ETF配息金額（元/單位）"),
+        highlight_index=div.get("highlight_index", 1),
+        unit="元",
+        output_path=output_path,
+        duration=duration,
+        watermark_text=div.get("watermark", "資料來源：投信公告"),
+    )
+
+
+def generate_animated_market_chart(
+    narration: str, output_path: str, duration: float = 6, chart_idx: int = 0,
+    chart_data: dict | None = None,
+) -> None:
+    """
+    Animated market chart fallback. chart_idx rotates through 3 distinct chart types
+    so repeated calls within the same video produce visually different charts.
+
+    idx=0  大盤指數表現       diverging bar (三大指數週漲跌)
+    idx=1  牛市年份漲幅       vertical bar  (多頭高峰年 S&P/加權年報酬示意)
+    idx=2  散戶 vs 大盤報酬  horizontal bar (一般投資人 vs 指數 vs 法人 示意)
+    """
+    if chart_data and chart_data.get("quarterly"):
+        q = chart_data["quarterly"]
+        generate_quarterly_comparison_chart(
+            data=q.get("data", []),
+            labels=q.get("labels", []),
+            title=q.get("title", "季線漲跌幅"),
+            unit=q.get("unit", "%"),
+            highlight_index=q.get("highlight_index", len(q.get("data", [])) - 1),
+            output_path=output_path,
+            highlight_color=q.get("highlight_color", "#FFD700"),
+            watermark=q.get("watermark", "數據來源：台灣證券交易所"),
+            duration=duration,
+            annotation=q.get("annotation", ""),
+        )
+        return
+
+    idx = chart_idx % 3
+
+    if idx == 0:
+        try:
+            changes, is_demo = _extract_index_changes(narration)
+            labels = list(changes.keys())
+            values = list(changes.values())
+            title  = "大盤指數表現" + ("（示意）" if is_demo else "")
+            _anim_horizontal_bar(
+                data=[abs(v) for v in values],
+                labels=labels,
+                title=title,
+                highlight_index=int(np.argmax([abs(v) for v in values])),
+                unit="%",
+                output_path=output_path,
+                duration=duration,
+            )
+        except Exception:
+            _anim_horizontal_bar(
+                data=[3.5, 4.2, 5.8],
+                labels=["道瓊", "標普500", "納斯達克"],
+                title="大盤指數（示意）",
+                highlight_index=2,
+                unit="%",
+                output_path=output_path,
+                duration=duration,
+            )
+
+    elif idx == 1:
+        # 牛市高峰年份台股 / S&P 漲幅（示意）
+        _anim_vertical_bar(
+            data=[26.1, 11.9, 23.7, 27.6, 18.9],
+            labels=["2009", "2013", "2017", "2019", "2021"],
+            title="牛市年份大盤漲幅（示意）",
+            unit="%",
+            color=_GREEN,
+            output_path=output_path,
+            duration=duration,
+        )
+
+    else:
+        # 散戶 vs 大盤 vs 法人 年化報酬率（示意）
+        _anim_horizontal_bar(
+            data=[6.2, 12.4, 9.8],
+            labels=["散戶投資人", "大盤指數", "法人機構"],
+            title="多頭期間年化報酬率（示意）",
+            highlight_index=1,
+            unit="%",
+            output_path=output_path,
+            duration=duration,
+        )

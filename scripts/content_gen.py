@@ -1,17 +1,47 @@
 import google.generativeai as genai
 import json
+import logging
 import os
+import time
 from dotenv import load_dotenv
 
 load_dotenv("config/.env")
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
+log = logging.getLogger(__name__)
+
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 2  # seconds; exponential backoff: 2s, 4s between attempts
+
+_DEFAULT_SEARCH_QUERIES = [
+    "stock market trading screen",
+    "financial chart growth",
+    "corporate earnings report",
+    "semiconductor chip technology",
+    "business finance dashboard",
+    "stock exchange trading floor",
+    "technology data center",
+    "AI processor chip",
+    "financial technology screen",
+    "global stock market",
+]
+
 _PROMPT = """你是一位專業的財經 YouTube Shorts 腳本作家，擅長將財報數字轉化為觀眾聽得懂的故事。
 
-請根據最新公開財報資料，為以下主題創作一支 60 秒的 YouTube Shorts 腳本：
+請為以下主題創作一支 60 秒的 YouTube Shorts 腳本：
 主題：{topic}
 
-【重要】旁白必須包含以下所有具體數字，每一項都要有實際數字，不得用「大幅成長」「顯著提升」等模糊描述帶過：
+以下是已驗證的財經研究資料，這是你唯一可以使用的數字來源：
+---
+{research}
+---
+
+【資料使用規則，必須嚴格遵守】
+- 只能使用上方「已驗證研究資料」中出現的數字，禁止使用你訓練資料或記憶中的舊數字，也禁止自行編造未列出的數字
+- 若上方資料中某項目標示「查無資料」、未提及、或整段資料標示無法取得，該項目在旁白中改用質化描述帶過（例如「本季獲利表現穩健」「維持成長動能」），絕對不要為了湊數字而憑空生成
+- chart_data 的每一個數值都必須直接對應到上方資料中出現的數字；找不到對應數字的欄位請留空陣列 []，不可捏造
+
+【重要】若上方資料充分，旁白應包含以下具體數字，每一項都要有實際數字，不得用「大幅成長」「顯著提升」等模糊描述帶過：
 1. 營收（新台幣或美元，含年增率 %）
 2. 毛利率（%）
 3. 營業利益（含年增率 %）
@@ -22,7 +52,7 @@ _PROMPT = """你是一位專業的財經 YouTube Shorts 腳本作家，擅長將
 請只回覆 JSON，格式如下：
 {{
   "title": "影片標題（含數字更吸睛，15字內）",
-  "narration": "完整旁白（繁體中文，300-400字，60秒長度）",
+  "narration": "完整旁白（繁體中文，300-400字，60秒長度；依下方圖表標記規則在適當位置插入 [CHART1][CHART2][CHART3]，每個標記各自獨佔一行）",
   "visual_prompts": [
     "scene 1: English prompt, financial setting, 9:16 vertical, cinematic, no text, no faces",
     "scene 2: ...",
@@ -68,6 +98,20 @@ _PROMPT = """你是一位專業的財經 YouTube Shorts 腳本作家，擅長將
 - 【亮點或風險 15秒】法說會展望、AI需求/地緣政治/匯率等關鍵因素
 - 【結尾 10秒】簡短總結 + call to action（「追蹤我們，掌握更多財報分析。」）
 
+圖表標記規則（必須執行）：
+- 依主題類型在旁白中插入標記，每個標記單獨佔一行，前後無其他文字
+- 教育型主題（含：如何、入門、風險、概念、教學、什麼是、新手）→ 插入 [CHART1][CHART2][CHART3]
+- 財報型主題（含：財報、EPS、營收、毛利率、具體公司財報分析）→ 插入 [CHART1][CHART2]
+- 市場型主題（含：週報、大盤、本週行情、三大指數、週一台股）→ 插入 [CHART1]
+- 放置時機：緊接在「首次出現具體數字或數據對比」的句子之前
+- 相鄰兩個標記之間必須間隔至少 50 個字（約 10 秒配音）
+- 標記在配音階段自動移除，不影響旁白語音，觀眾不會聽到
+- 格式範例（標記單獨一行）：
+
+  「...這波上漲背後有一個關鍵數字。
+  [CHART1]
+  台積電近一季毛利率達到53.1%，創下近八季新高...」
+
 visual_prompts 規則：
 - 3-4 個場景，英文
 - 具體元素：rising bar charts, semiconductor wafer fab, stock trading screens, financial report data
@@ -81,7 +125,8 @@ search_queries 規則（重要）：
 - 10 個關鍵字應盡量多樣化，涵蓋不同角度
 
 chart_data 規則（重要）：
-- 使用實際公開財報數字，不可捏造
+- 只能使用上方「已驗證研究資料」中出現的數字，不可捏造，也不可使用訓練資料中的舊數字
+- 找不到對應數字的欄位留空陣列 []
 - quarters 最近 4 季，格式 "YYYYQN"
 - revenue / net_profit 單位與 unit 欄位一致
 - gross_margin 單位為 %（例如 53.5 代表 53.5%）
@@ -145,23 +190,101 @@ chart_data 規則：使用旁白中提到的實際數字填寫，不可捏造。
 """
 
 
-def generate_script(topic: str, narration_override: str | None = None) -> dict:
+_NO_RESEARCH_DATA = "（未提供已驗證研究資料，禁止捏造具體數字，本題材請改用質化描述）"
+
+
+def _extract_json(text: str) -> str:
+    """Strip ```json / ``` code fences if the model added them despite JSON mode."""
+    text = text.strip()
+    if "```json" in text:
+        return text.split("```json")[1].split("```")[0].strip()
+    if "```" in text:
+        return text.split("```")[1].split("```")[0].strip()
+    return text
+
+
+def _validate_and_fill(result: dict, topic: str) -> dict:
+    """Ensure required fields (title, narration, search_queries) exist with sane
+    types. Missing or malformed fields get a safe default instead of letting
+    a KeyError/TypeError crash the pipeline downstream."""
+    if not isinstance(result, dict):
+        log.warning("Gemini 回傳非 JSON 物件，改用空白腳本套用預設值")
+        result = {}
+
+    title = result.get("title")
+    if not isinstance(title, str) or not title.strip():
+        log.warning("腳本缺少有效 title，改用主題作為預設標題")
+        result["title"] = (topic.strip()[:15] if topic and topic.strip() else "財經快訊")
+
+    narration = result.get("narration")
+    if not isinstance(narration, str) or not narration.strip():
+        log.warning("腳本缺少有效 narration，改用預設旁白")
+        result["narration"] = (
+            f"{topic or '本集主題'}。腳本生成異常，暫無法提供完整分析內容，請關注後續更新。"
+            "本影片僅供教育用途，不構成投資建議。"
+        )
+
+    search_queries = result.get("search_queries")
+    if not isinstance(search_queries, list) or not all(
+        isinstance(q, str) and q.strip() for q in search_queries
+    ):
+        log.warning("腳本缺少有效 search_queries，改用預設關鍵字組")
+        result["search_queries"] = list(_DEFAULT_SEARCH_QUERIES)
+
+    return result
+
+
+def generate_script(
+    topic: str,
+    narration_override: str | None = None,
+    research_data: str | None = None,
+) -> dict:
+    """Generate the video script via Gemini.
+
+    research_data: pre-fetched, verified financial facts (e.g. gathered by
+    Firecrawl before calling this function) that Gemini must treat as its only
+    source of numbers — Gemini's role here is copywriting/formatting, not
+    fact-finding. When omitted, the prompt instructs Gemini to fall back to
+    qualitative descriptions instead of inventing figures from memory.
+    """
     model = genai.GenerativeModel("gemini-2.5-flash")
 
     if narration_override:
         prompt = _METADATA_PROMPT.format(narration=narration_override.strip())
     else:
-        prompt = _PROMPT.format(topic=topic)
+        research_text = research_data.strip() if research_data and research_data.strip() else ""
+        if not research_text:
+            log.warning("未提供 research_data，改用質化描述模式（不捏造數字）")
+            research_text = _NO_RESEARCH_DATA
+        prompt = _PROMPT.format(topic=topic, research=research_text)
 
-    response = model.generate_content(prompt)
-    text = response.text.strip()
+    generation_config = genai.types.GenerationConfig(response_mime_type="application/json")
 
-    if "```json" in text:
-        text = text.split("```json")[1].split("```")[0].strip()
-    elif "```" in text:
-        text = text.split("```")[1].split("```")[0].strip()
+    result: dict | None = None
+    last_exc: Exception | None = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            response = model.generate_content(prompt, generation_config=generation_config)
+            result = json.loads(_extract_json(response.text))
+            break
+        except Exception as e:
+            last_exc = e
+            if attempt < _MAX_RETRIES:
+                delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                log.warning(
+                    f"Gemini 腳本生成失敗（第 {attempt}/{_MAX_RETRIES} 次）：{e}，"
+                    f"{delay}s 後重試"
+                )
+                time.sleep(delay)
+            else:
+                log.error(f"Gemini 腳本生成連續失敗 {_MAX_RETRIES} 次：{e}")
 
-    result = json.loads(text)
+    if result is None:
+        result = {}
+
+    result = _validate_and_fill(result, topic)
+
     if narration_override:
         result["narration"] = narration_override.strip()
+
     return result

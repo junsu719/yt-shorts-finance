@@ -82,21 +82,32 @@ def compose_video(config: dict) -> dict:
 
 
 def _resolve_chart_path(chart_id: int, config: dict) -> Path | None:
-    """config 優先，若無則 fallback 到 CHARTS_DIR 已存在的檔案。"""
+    """config 優先，若無則 fallback 到 CHARTS_DIR 已存在的檔案。
+    同時支援舊版 .png 與新版動畫 .mp4。
+    """
     chart_files = {
-        1: CHARTS_DIR / "chart1_four_statements.png",
-        2: CHARTS_DIR / "chart2_eps_comparison.png",
-        3: CHARTS_DIR / "chart3_earnings_calendar.png",
+        1: [
+            CHARTS_DIR / "chart1_vertical_bar.mp4",    # 新版動畫
+            CHARTS_DIR / "chart1_four_statements.png",  # 舊版靜態
+        ],
+        2: [
+            CHARTS_DIR / "chart2_horizontal_bar.mp4",
+            CHARTS_DIR / "chart2_eps_comparison.png",
+        ],
+        3: [
+            CHARTS_DIR / "chart3_diverging_bar.mp4",
+            CHARTS_DIR / "chart3_earnings_calendar.png",
+        ],
     }
-    # config 傳入的路徑
+    # config 傳入的路徑（優先）
     from_config = config.get("charts", {}).get(chart_id)
     if from_config and Path(from_config).exists():
         return Path(from_config)
-    # fallback：直接從 charts/ 目錄抓
-    fallback = chart_files.get(chart_id)
-    if fallback and fallback.exists():
-        print(f"  [fallback] 圖表{chart_id} 從 CHARTS_DIR 載入：{fallback}")
-        return fallback
+    # fallback：CHARTS_DIR，優先 MP4 再 PNG
+    for candidate in chart_files.get(chart_id, []):
+        if candidate.exists():
+            print(f"  [fallback] 圖表{chart_id} 從 CHARTS_DIR 載入：{candidate}")
+            return candidate
     return None
 
 
@@ -114,7 +125,7 @@ def _resolve_audio_path(config: dict) -> Path | None:
 
 def _compose_with_moviepy(config, output_path, preview_dir):
     from moviepy import (
-        ImageClip, AudioFileClip, CompositeVideoClip,
+        ImageClip, VideoFileClip, AudioFileClip, CompositeVideoClip,
         TextClip, concatenate_videoclips, ColorClip,
     )
 
@@ -130,10 +141,17 @@ def _compose_with_moviepy(config, output_path, preview_dir):
         chart_path = _resolve_chart_path(chart_id, config) if chart_id else None
         if chart_path:
             print(f"  [圖表] ✓ 載入 chart{chart_id}：{chart_path}")
-            chart_clip = (ImageClip(str(chart_path))
-                          .with_duration(duration)
-                          .resized(width=int(W * 0.6))
-                          .with_position((0, (H - int(H * 0.9)) // 2)))
+            suffix = chart_path.suffix.lower()
+            if suffix == ".mp4":
+                _vfc = VideoFileClip(str(chart_path))
+                chart_clip = (_vfc.subclipped(0, min(duration, _vfc.duration))
+                              .resized(width=int(W * 0.6))
+                              .with_position((0, (H - int(H * 0.9)) // 2)))
+            else:
+                chart_clip = (ImageClip(str(chart_path))
+                              .with_duration(duration)
+                              .resized(width=int(W * 0.6))
+                              .with_position((0, (H - int(H * 0.9)) // 2)))
             layers.append(chart_clip)
         elif chart_id:
             print(f"  [圖表] ✗ chart{chart_id} 找不到，跳過")

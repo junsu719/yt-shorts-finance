@@ -132,15 +132,22 @@ def srt_to_ass(srt_path: str, ass_path: str):
     Path(ass_path).write_text(header + "\n".join(dialogues) + "\n", encoding="utf-8")
 
 
-def concat_clips(clip_paths: list[str], output_path: str):
-    """Concat video clips; invalid clips are replaced with a dark fallback."""
+def concat_clips(clip_paths: list[str], output_path: str, clip_durations: list[float] | None = None):
+    """Concat video clips; invalid clips are replaced with a dark fallback.
+
+    clip_durations: optional list parallel to clip_paths giving each slot's
+    intended duration (seconds), used to size the fallback clip so a missing
+    slot doesn't shorten the background below the audio length. Defaults to
+    5.0s per clip when not provided (legacy behavior).
+    """
     validated: list[str] = []
-    for p in clip_paths:
+    for i, p in enumerate(clip_paths):
         if _is_valid_clip(p):
             validated.append(p)
         else:
             fallback = p.replace(".mp4", "_fallback.mp4")
-            make_fallback_clip(fallback, duration=5.0)
+            dur = clip_durations[i] if clip_durations and i < len(clip_durations) else 5.0
+            make_fallback_clip(fallback, duration=dur)
             validated.append(fallback)
 
     list_file = output_path + ".txt"
@@ -186,11 +193,23 @@ def _tile_to_duration(video_path: str, output_path: str, target_duration: float)
 
 
 def assemble(video_path: str, audio_path: str, output_path: str, srt_path: str | None = None):
-    """Combine background video with audio narration and optional burned-in subtitles."""
-    duration = math.ceil(_audio_duration(audio_path))
+    """Combine background video with audio narration and optional burned-in subtitles.
 
-    tiled = output_path + ".tiled.mp4"
-    _tile_to_duration(video_path, tiled, duration + 1)
+    With the multi-slot pipeline, pre-trimmed clips are concatenated so that
+    background duration ≈ audio duration.  In that case tiling is skipped entirely
+    (saves a full re-encode pass).  Tiling is still performed when background is
+    shorter than audio — legacy flows or edge cases.
+    """
+    duration = math.ceil(_audio_duration(audio_path))
+    bg_dur   = _video_duration(video_path)
+
+    tiled: str | None = None
+    if bg_dur < duration:
+        tiled    = output_path + ".tiled.mp4"
+        _tile_to_duration(video_path, tiled, duration + 2)
+        bg_input = tiled
+    else:
+        bg_input = video_path
 
     vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
 
@@ -206,7 +225,7 @@ def assemble(video_path: str, audio_path: str, output_path: str, srt_path: str |
         subprocess.run(
             [
                 "ffmpeg", "-y",
-                "-i", tiled,
+                "-i", bg_input,
                 "-i", audio_path,
                 "-map", "0:v", "-map", "1:a",
                 "-vf", vf,
@@ -219,5 +238,5 @@ def assemble(video_path: str, audio_path: str, output_path: str, srt_path: str |
             check=True,
         )
     finally:
-        if os.path.exists(tiled):
+        if tiled and os.path.exists(tiled):
             os.remove(tiled)

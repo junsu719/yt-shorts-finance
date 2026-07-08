@@ -17,16 +17,33 @@ def synthesize(
     text: str,
     audio_path: str,
     srt_path: str | None = None,
+    charts_path: str | None = None,
     voice: str = VOICE,
     rate: str = "+5%",
 ) -> float:
-    """Generate TTS audio and SRT. Returns actual audio duration in seconds."""
-    return asyncio.run(_run(_normalize_for_tts(text), audio_path, srt_path, voice, rate))
+    """Generate TTS audio and SRT. Returns actual audio duration in seconds.
+
+    If the narration contains [CHARTn] markers and charts_path is provided,
+    writes a JSON file mapping "CHART1" → start_timestamp_seconds.
+    Markers are stripped before synthesis so they are never spoken aloud.
+    """
+    clean_text, chart_at = _extract_chart_markers(text)
+    return asyncio.run(
+        _run(_normalize_for_tts(clean_text), audio_path, srt_path, chart_at, charts_path, voice, rate)
+    )
 
 
 # ── Core: per-sentence synthesis ──────────────────────────────────────────────
 
-async def _run(text: str, audio_path: str, srt_path: str | None, voice: str, rate: str) -> float:
+async def _run(
+    text: str,
+    audio_path: str,
+    srt_path: str | None,
+    chart_at: dict[str, int],
+    charts_path: str | None,
+    voice: str,
+    rate: str,
+) -> float:
     """Split narration into sentences, synthesize each, measure with ffprobe,
     concatenate into final audio, then build SRT from real timestamps."""
     sentences = _split_sentences(text)
@@ -66,6 +83,22 @@ async def _run(text: str, audio_path: str, srt_path: str | None, voice: str, rat
         if srt_path:
             _build_srt_from_segments(sentences, seg_durations, srt_path)
 
+        # Step 4: write chart timestamps derived from sentence-level durations
+        if chart_at and charts_path:
+            cumulative = [0.0]
+            for dur in seg_durations:
+                cumulative.append(cumulative[-1] + dur)
+            timestamps = {
+                marker: round(cumulative[idx], 3)
+                for marker, idx in chart_at.items()
+                if idx < len(cumulative)
+            }
+            if timestamps:
+                Path(charts_path).write_text(
+                    json.dumps(timestamps, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -103,6 +136,44 @@ def _build_srt_from_segments(
 
 
 # ── Text helpers ──────────────────────────────────────────────────────────────
+
+_CHART_MARKER_RE = re.compile(r"\[CHART(\d+)\]")
+
+
+def _extract_chart_markers(text: str) -> tuple[str, dict[str, int]]:
+    """Strip [CHARTn] markers from narration and record which sentence each precedes.
+
+    Markers may appear inline (e.g. '…每張領600元。[CHART1]除息日…') or on their own
+    line — both are handled. Every [CHARTn] occurrence is removed so it is never spoken.
+
+    Returns:
+        clean_text  — narration with all [CHARTn] markers removed
+        chart_at    — {"CHART1": sentence_index, ...}
+                      sentence_index is the 0-based index of the first sentence
+                      *after* the marker, matching _split_sentences(clean_text).
+
+    The index is computed by running _split_sentences on the clean text that precedes
+    each marker, so it stays consistent with the full-text segmentation used in _run.
+    """
+    chart_at: dict[str, int] = {}
+    clean_parts: list[str] = []
+    prefix = ""          # clean text accumulated before the current marker
+    last = 0
+
+    for m in _CHART_MARKER_RE.finditer(text):
+        segment = text[last:m.start()]
+        prefix += segment
+        clean_parts.append(segment)
+        chart_at[f"CHART{m.group(1)}"] = len(_split_sentences(prefix))
+        last = m.end()
+
+    clean_parts.append(text[last:])
+    clean_text = "".join(clean_parts)
+    # Collapse blank lines left behind by own-line markers.
+    clean_text = re.sub(r"[ \t]*\n[ \t]*(?:\n[ \t]*)+", "\n", clean_text).strip()
+
+    return clean_text, chart_at
+
 
 def _split_sentences(text: str) -> list[str]:
     """Split narration into sentence-level chunks for per-segment TTS."""

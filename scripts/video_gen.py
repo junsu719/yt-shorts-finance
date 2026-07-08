@@ -41,6 +41,10 @@ _BLOCKED_KEYWORDS: set[str] = {
     # Nature / travel / lifestyle
     "nature", "landscape", "beach", "ocean", "forest", "flower",
     "travel", "tourism", "vacation", "wedding", "birthday", "party",
+    # Cryptocurrency / blockchain
+    "bitcoin", "cryptocurrency", "crypto", "blockchain",
+    "ethereum", "coin", "digital currency", "nft", "defi",
+    "altcoin", "token", "wallet", "mining",
 }
 
 
@@ -252,12 +256,23 @@ def _file_md5(path: str) -> str:
     return h.hexdigest()
 
 
-def _encode_clip(url: str, output_path: str, seen_hashes: set[str] | None = None) -> bool:
+def _encode_clip(
+    url: str,
+    output_path: str,
+    seen_hashes: set[str] | None = None,
+    clip_duration: float | None = None,
+    width: int = 1080,
+    height: int = 1920,
+) -> bool:
     """Download url, encode to output_path, return True if clip is valid and unique.
 
+    clip_duration: trim to this many seconds.  Defaults to _MAX_CLIP_SECONDS (25 s).
+    width/height:  output resolution (default portrait 1080×1920; pass 1920/1080 for landscape).
     Rejects static clips (bitrate < _MIN_MOTION_BITRATE) and content duplicates
     (MD5 already in seen_hashes). On rejection the output file is removed.
     """
+    target_secs = clip_duration if (clip_duration and clip_duration > 0) else _MAX_CLIP_SECONDS
+
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         tmp_path = tmp.name
     try:
@@ -270,8 +285,8 @@ def _encode_clip(url: str, output_path: str, seen_hashes: set[str] | None = None
         subprocess.run(
             [
                 "ffmpeg", "-y", "-i", tmp_path,
-                "-t", str(_MAX_CLIP_SECONDS),
-                "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+                "-t", str(target_secs),
+                "-vf", f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}",
                 "-c:v", "libx264", "-preset", "ultrafast",
                 "-r", "30", "-pix_fmt", "yuv420p", "-an",
                 output_path,
@@ -315,13 +330,18 @@ def fetch_clip(
     source: str = "auto",
     seen_ids: set | None = None,
     seen_hashes: set[str] | None = None,
+    clip_duration: float | None = None,
+    width: int = 1080,
+    height: int = 1920,
 ):
-    """Download a unique portrait video clip to output_path.
+    """Download a unique video clip to output_path.
 
-    source: "pexels" | "pixabay" | "mixkit" | "vecteezy" | "auto"
-    seen_ids:     shared set of API video IDs already used; prevents same ID twice.
-    seen_hashes:  shared set of MD5 hashes of encoded clips; prevents same content twice.
-                  Pass the same set across all fetch_clip calls in a session.
+    source:        "pexels" | "pixabay" | "mixkit" | "vecteezy" | "auto"
+    seen_ids:      shared set of API video IDs already used; prevents same ID twice.
+    seen_hashes:   shared set of MD5 hashes of encoded clips; prevents same content twice.
+    clip_duration: trim clip to exactly this many seconds (slot duration).
+                   Defaults to _MAX_CLIP_SECONDS (25 s) when None.
+    width/height:  output resolution (default portrait 1080×1920; pass 1920/1080 for landscape).
     """
     if seen_ids is None:
         seen_ids = set()
@@ -331,7 +351,7 @@ def fetch_clip(
         url = _resolve_url(query, source, seen_ids)
         if url is None:
             break
-        if _encode_clip(url, output_path, seen_hashes):
+        if _encode_clip(url, output_path, seen_hashes, clip_duration, width, height):
             return
 
     # Fallback to generic queries across all sources
@@ -341,7 +361,7 @@ def fetch_clip(
             if url is None:
                 break
             print(f"[video] '{query}' 無動態素材，改用 fallback: '{fallback}'")
-            if _encode_clip(url, output_path, seen_hashes):
+            if _encode_clip(url, output_path, seen_hashes, clip_duration, width, height):
                 return
 
     raise RuntimeError(f"找不到合適的動態影片素材（query='{query}'）")
