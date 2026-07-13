@@ -392,4 +392,41 @@ python -c "import matplotlib; print(matplotlib.__version__)"
 - YouTube 上傳需先完成 OAuth 授權（`config/client_secret.json`）
 - Vecteezy API key 需加入 `config/.env`（`VECTEEZY_API_KEY=...`）
 - Mixkit 爬蟲依賴 CDN URL regex，若 Mixkit 改版可能需更新 `video_gen.py` 的 patterns
+
+---
+
+## 已知問題與解法
+
+### 問題：分段輸出後在剪輯軟體合成，接縫處配音重疊
+
+**現象**
+把各 clip 分段輸出（每段含配音），
+在 CapCut 等剪輯軟體依序拼接後，
+片段接續處的語音會有些微重疊，聽起來不自然。
+
+**根因**
+MP3/AAC 編碼在每段音訊的開頭和結尾都有 padding，
+分段輸出時每段各自包含一段配音，
+21 個片段接起來就會累積出可感知的重疊。
+
+**正確做法（分段輸出時必須遵守）**
+1. 輸出「無聲」的影片片段（只有畫面和字幕）
+   檔名格式：clip_XX_mute.mp4
+   輸出路徑：output/[專案名]_segments/mute/
+
+2. 另外輸出一個「完整連續配音」音檔
+   檔名：narration_full.mp3
+   整支影片的旁白一氣呵成，不切割
+
+3. 使用者在剪輯軟體的操作：
+   - 21 個無聲片段依序拼接
+   - narration_full.mp3 放到音軌
+   - 配音連續，無接縫問題
+
+**裁切注意事項**
+裁切片段時不可用 -c:v copy（stream copy），
+因為 stream copy 只能在關鍵影格處切，
+會導致總長度與旁白不符（實測誤差達 1.57 秒）。
+必須重新編碼裁切（-t 精準卡在指定時長），
+誤差可控制在 0.4 秒內（分散在各段，無感知）。
 - 輸出路徑：`/mnt/d/yt-shorts-finance/output/`(D 槽)
